@@ -67,8 +67,9 @@ class Settings:
     # click count as "start of field"? Off = safer (no wrong capitals mid-sentence).
     cap_after_click = False
     first_run = True
+    debug = False   # diagnostic log: records decisions, never what you type
 
-    _FIELDS = ("enabled", "fix_i", "cap_after_click", "first_run")
+    _FIELDS = ("enabled", "fix_i", "cap_after_click", "first_run", "debug")
 
     def load(self):
         import json
@@ -127,6 +128,32 @@ def set_start_with_windows(on):
         traceback.print_exc()
 
 
+class Diag:
+    """Diagnostic log (tray menu > Diagnostic log). Writes WHY a letter was or
+    wasn't capitalized, which app, and timings. Never the text you type."""
+    _lines = []
+    _lock = threading.Lock()
+
+    @classmethod
+    def log(cls, msg):
+        if settings.debug:
+            with cls._lock:
+                cls._lines.append(f"{time.strftime('%H:%M:%S')}.{int(time.time() * 1000) % 1000:03d} {msg}")
+
+    @classmethod
+    def flush(cls):
+        with cls._lock:
+            lines, cls._lines = cls._lines, []
+        if not lines:
+            return
+        try:
+            os.makedirs(APP_DIR, exist_ok=True)
+            with open(os.path.join(APP_DIR, "diagnostic.log"), "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except OSError:
+            pass
+
+
 def setup_logging():
     """Without a console window, errors go to %APPDATA%\\AutoCap\\autocap.log (no keystrokes)."""
     if sys.stderr is not None and not getattr(sys, "frozen", False):
@@ -142,7 +169,7 @@ def setup_logging():
         pass
 
 SETTLE_DELAY = 0.025     # wait for the app to move the cursor after a click/Enter
-RESULT_TIMEOUT = 0.06    # max time a key waits for field info (rarely used)
+RESULT_TIMEOUT = 0.10    # max time a key waits for field info (rarely used)
 
 # --------------------------------------------------------------------------
 # Win32 declarations
@@ -328,12 +355,15 @@ def process_name(pid):
 # --------------------------------------------------------------------------
 
 class FieldInfo:
-    __slots__ = ("gen", "allowed", "context")
+    __slots__ = ("gen", "allowed", "context", "reason", "app", "ms")
 
-    def __init__(self, gen, allowed, context):
+    def __init__(self, gen, allowed, context, reason="", app="", ms=0):
         self.gen = gen              # which "focus generation" this answer belongs to
         self.allowed = allowed      # False for password fields, blocked apps, errors
         self.context = context      # text right before the cursor, or None if unknown
+        self.reason = reason        # why not allowed (for the diagnostic log)
+        self.app = app
+        self.ms = ms                # how long Windows took to answer
 
 
 class FocusWatcher(threading.Thread):
@@ -354,6 +384,7 @@ class FocusWatcher(threading.Thread):
         self.thread_id = None
         self.ready = threading.Event()
         self._focus_proc = WINEVENTPROC(self._on_focus_event)
+        self._last_focus = None
         self.uia = None
         self.UIA = None
 
@@ -392,6 +423,13 @@ class FocusWatcher(threading.Thread):
 
     # ---- the thread ----
     def _on_focus_event(self, hook, event, hwnd, id_object, id_child, thread, ms):
+        # Chrome/Electron apps (Discord, WhatsApp, Teams...) can repeat the focus
+        # event for the SAME box many times. Only a real change resets the state.
+        key = (hwnd, id_object, id_child)
+        if key == self._last_focus:
+            return
+        self._last_focus = key
+        Diag.log("focus changed")
         self.bump()
 
     def run(self):
@@ -425,6 +463,8 @@ class FocusWatcher(threading.Thread):
                 user32.DispatchMessageW(ctypes.byref(msg))
             if running:
                 self._service()
+                Diag.flush()
+        Diag.flush()
         if hook:
             user32.UnhookWinEvent(hook)
 
@@ -443,30 +483,40 @@ class FocusWatcher(threading.Thread):
                 self.urgent = False
                 if self.gen != gen:
                     continue
-            allowed, context = self._query()
+            t0 = time.monotonic()
+            allowed, context, reason, app = self._query()
+            ms = int((time.monotonic() - t0) * 1000)
+            Diag.log(f"checked field: app={app or '?'} allowed={allowed} "
+                     f"{reason} text-before-cursor={'yes' if context is not None else 'unknown'} took={ms}ms")
             with self.cond:
                 if self.gen == gen:
-                    self.result = FieldInfo(gen, allowed, context)
+                    self.result = FieldInfo(gen, allowed, context, reason, app, ms)
                     self.cond.notify_all()
                     return
 
     def _query(self):
-        if self.uia is None or not settings.enabled:
-            return False, None
+        """Returns (allowed, text_before_cursor, reason, app_name)."""
+        if self.uia is None:
+            return False, None, "reason=no-ui-automation", ""
+        if not settings.enabled:
+            return False, None, "reason=paused", ""
+        app = ""
         try:
             el = self.uia.GetFocusedElement()
             if not el:
-                return False, None
+                return False, None, "reason=nothing-focused", app
             pid = el.CurrentProcessId
             if pid == os.getpid():
-                return False, None
-            if process_name(pid) in BLOCKED_APPS:
-                return False, None
+                return False, None, "reason=autocap-itself", app
+            app = process_name(pid)
+            if app in BLOCKED_APPS:
+                return False, None, "reason=blocked-app", app
             if el.CurrentIsPassword:
-                return False, None
-            return True, self._text_before_caret(el)
-        except Exception:
-            return False, None          # when unsure, do nothing
+                return False, None, "reason=password-field", app
+            return True, self._text_before_caret(el), "", app
+        except Exception as e:
+            # when unsure, do nothing (e.g. admin apps refuse to answer)
+            return False, None, f"reason=error:{type(e).__name__}", app
 
     def _text_before_caret(self, el):
         try:
@@ -600,14 +650,23 @@ class Engine:
             self._append(typed)
             return False
 
+        t0 = time.monotonic()
         info = self._info()
+        waited = int((time.monotonic() - t0) * 1000)
         self._materialize(info)
-        if (info is not None and info.allowed
-                and should_capitalize(self.buffer, self.at_start)
-                and send_text(upper)):
+        if info is None:
+            Diag.log(f"SKIPPED: Windows didn't answer in time (waited {waited}ms)")
+        elif not info.allowed:
+            Diag.log(f"skipped: {info.reason} app={info.app}")
+        elif not should_capitalize(self.buffer, self.at_start):
+            Diag.log(f"no capital needed (mid-sentence) app={info.app}")
+        elif send_text(upper):
+            Diag.log(f"CAPITALIZED app={info.app} waited={waited}ms")
             self.suppressed.add(vk)
             self._append(upper)
             return True
+        else:
+            Diag.log(f"SKIPPED: Windows refused the typed capital app={info.app}")
         self._append(typed)
         return False
 
@@ -744,6 +803,15 @@ def run_tray(watcher, hooks):
     def toggle_startup(icon, item):
         set_start_with_windows(not starts_with_windows())
 
+    def toggle_debug(icon, item):
+        settings.debug = not settings.debug
+        settings.save()
+        Diag.log("diagnostic log turned on" if settings.debug else "diagnostic log turned off")
+
+    def open_logs(icon, item):
+        os.makedirs(APP_DIR, exist_ok=True)
+        os.startfile(APP_DIR)
+
     def open_help(icon, item):
         threading.Thread(target=show_message, args=(HELP_TEXT,), daemon=True).start()
 
@@ -758,6 +826,10 @@ def run_tray(watcher, hooks):
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Start with Windows", toggle_startup, checked=lambda i: starts_with_windows()),
         pystray.MenuItem("How it works", open_help),
+        pystray.MenuItem("Troubleshooting", pystray.Menu(
+            pystray.MenuItem("Diagnostic log", toggle_debug, checked=lambda i: settings.debug),
+            pystray.MenuItem("Open log folder", open_logs),
+        )),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", quit_app),
     )
